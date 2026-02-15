@@ -2,8 +2,12 @@ from scipy.stats import skellam
 from scipy.optimize import minimize_scalar
 from scipy.optimize import root_scalar
 
+from xgboost import XGBRegressor
+
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 def poisson_u25(mu, U25_prob):
@@ -142,47 +146,38 @@ def version1_dataset(games_uncomplete):
                               'Opponent Yellow Cards', 'Team Red Cards', 'Opponent Red Cards', "PredictedXG"]]
 
 
-def get_schedule(current_season):    
+def get_schedule(current_season):
     """
-    Load the schedule.csv file and return only fixtures after the current season data.
-
-    The output is formatted so each fixture becomes two rows, one for the home team and
-    one for the away team.
-
-    Arguments:
-        current_season (pd.DataFrame): dataframe containing at least a 'Date' column.
-
-    Returns:
-        pd.DataFrame: upcoming fixtures with Team, Opponent, Location and Date.
+    Load schedule.csv and return only fixtures after the current season data.
+    Output is team-level (two rows per fixture).
     """
-    max_date = current_season['Date'].max()
+    max_date = current_season["Date"].max()
 
-    schedule = pd.read_csv('Data/schedule.csv')
-    schedule['Date'] = pd.to_datetime(schedule['Date']).dt.normalize()
+    schedule = pd.read_csv("Data/schedule.csv")
 
-    # Filter out fixtures that have already happened
-    schedule = schedule[schedule['Date'] > max_date]
+    dt = pd.to_datetime(schedule["Date"], dayfirst=True, errors="coerce")
+    schedule["Time"] = dt.dt.strftime("%H:%M")
+    schedule["Date"] = dt.dt.normalize()
+
+    schedule = schedule[schedule["Date"] > max_date]
 
     home_df = schedule.copy()
     away_df = schedule.copy()
 
-    # Create home team rows
-    home_df['Location'] = 'Home'
-    home_df = home_df.rename(columns={'Home Team': 'Team', 'Away Team': 'Opponent'})
-    home_df = home_df.drop(columns=['Match Number', 'Round Number', 'Result'])
+    home_df["Location"] = "Home"
+    home_df = home_df.rename(columns={"Home Team": "Team", "Away Team": "Opponent"})
+    home_df = home_df.drop(columns=["Match Number", "Round Number", "Result"])
 
-    # Create away team rows
-    away_df['Location'] = 'Away'
-    away_df = away_df.rename(columns={'Home Team': 'Opponent', 'Away Team': 'Team'})
-    away_df = away_df.drop(columns=['Match Number', 'Round Number', 'Result'])
+    away_df["Location"] = "Away"
+    away_df = away_df.rename(columns={"Home Team": "Opponent", "Away Team": "Team"})
+    away_df = away_df.drop(columns=["Match Number", "Round Number", "Result"])
 
-    output = pd.concat([home_df, away_df]).sort_values(by='Date', ascending=True).reset_index().drop(columns=['index'])
+    output = pd.concat([home_df, away_df]).sort_values(by="Date", ascending=True).reset_index(drop=True)
 
-    # Align team names to match the training dataset
-    output.loc[output['Team'] == 'Man Utd', 'Team'] = 'Man United'
-    output.loc[output['Team'] == 'Spurs', 'Team'] = 'Tottenham'
-    output.loc[output['Opponent'] == 'Man Utd', 'Opponent'] = 'Man United'
-    output.loc[output['Opponent'] == 'Spurs', 'Opponent'] = 'Tottenham'
+    output.loc[output["Team"] == "Man Utd", "Team"] = "Man United"
+    output.loc[output["Team"] == "Spurs", "Team"] = "Tottenham"
+    output.loc[output["Opponent"] == "Man Utd", "Opponent"] = "Man United"
+    output.loc[output["Opponent"] == "Spurs", "Opponent"] = "Tottenham"
 
     return output
 
@@ -266,7 +261,7 @@ def rolling_features(df, stats_window, betting_window):
         df.groupby('Opponent')['PredictedXG']
         .transform(lambda x: x.shift(1).rolling(betting_window, min_periods=10).mean())
         / league_avg
-    )
+    ) 
 
     weights = {'fouls': 1.0, 'yellow': 3.0, 'red': 6.0}
 
@@ -418,3 +413,455 @@ def prepare_data(stats_window, betting_window):
     df['weekday_code'] = df['Weekday'].astype('category').cat.codes
 
     return df
+
+def expanding_window_len(horizon, start_window, max_window, growth_rate):
+    """
+    Returns the rolling window length to use for a given horizon.
+
+    Arguments:
+        horizon (int): 1 = next match, 2 = second match ahead, etc.
+        start_window (int): window length used for the next match.
+        max_window (int): maximum window length allowed.
+        growth_rate (float): controls how quickly the window expands toward max_window.
+
+    Returns:
+        window (int): rolling window length to use.
+    """
+    window = start_window + (max_window - start_window) * (1 - np.exp(-growth_rate * (horizon - 1)))
+    window = int(np.ceil(window))
+    return min(window, max_window)
+
+
+def get_historic_schedule(season_raw_df, cutoff_date):
+    """
+    Creates the same style output as get_schedule() but for historic seasons, using the raw match list.
+
+    Arguments:
+        season_raw_df (pd.DataFrame): raw match-level dataframe for a season (one row per match).
+        cutoff_date (str|pd.Timestamp): date separating played vs future fixtures.
+
+    Returns:
+        pd.DataFrame: team-level future fixtures with columns:
+                      ['Date', 'Time'(optional), 'Team', 'Opponent', 'Location']
+    """
+    df = season_raw_df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce").dt.normalize()
+    cutoff = pd.to_datetime(cutoff_date).normalize()
+
+    df_future = df[df["Date"] > cutoff].sort_values(["Date"]).copy()
+
+    home_rows = pd.DataFrame({
+        "Date": df_future["Date"].values,
+        "Team": df_future["HomeTeam"].values,
+        "Opponent": df_future["AwayTeam"].values,
+        "Location": "Home",
+    })
+
+    away_rows = pd.DataFrame({
+        "Date": df_future["Date"].values,
+        "Team": df_future["AwayTeam"].values,
+        "Opponent": df_future["HomeTeam"].values,
+        "Location": "Away",
+    })
+
+    if "Time" in df_future.columns:
+        home_rows["Time"] = df_future["Time"].values
+        away_rows["Time"] = df_future["Time"].values
+
+    schedule = pd.concat([home_rows, away_rows], ignore_index=True)
+
+    sort_cols = ["Date", "Team"]
+    if "Time" in schedule.columns:
+        sort_cols = ["Date", "Time", "Team"]
+
+    schedule = schedule.sort_values(sort_cols).reset_index(drop=True)
+    return schedule
+
+
+import numpy as np
+import pandas as pd
+
+def prepare_data_future(stats_start, stats_max, stats_growth, bet_start, bet_max, bet_growth, cutoff_date=None):
+    """
+    Build the modelling dataframe for future fixtures by dynamically populating rolling features
+    using only information available up to a cutoff date.
+
+    Key modelling choices:
+    - Horizon is defined per team for future fixtures: 1 = next match after cutoff, 2 = second, etc.
+    - Window lengths for a fixture are determined by that row's horizon (h_team).
+    - Opponent uses the SAME window lengths (W_stats, W_bet) for that fixture (symmetry).
+    - defence_strength is computed to MATCH rolling_features(): it uses a series grouped by 'Opponent'
+      (not by 'Team'), so we build an opp_bet_cache for that.
+
+    Arguments:
+        stats_start (int): rolling window length for next match stats (horizon=1).
+        stats_max (int): maximum rolling window length for stats.
+        stats_growth (float): expansion rate for stats window.
+        bet_start (int): rolling window length for next match betting features (horizon=1).
+        bet_max (int): maximum rolling window length for betting window.
+        bet_growth (float): expansion rate for betting window.
+        cutoff_date (str|pd.Timestamp|None): if None, uses current point in 25-26 season.
+                                            if provided, builds future fixtures from that point in the matching season.
+
+    Returns:
+        pd.DataFrame: future fixtures dataframe with populated features and codes.
+    """
+
+    df20 = pd.read_csv("Data/PL2020.csv"); df20["Season"] = "20-21"
+    df21 = pd.read_csv("Data/PL2021.csv"); df21["Season"] = "21-22"
+    df22 = pd.read_csv("Data/PL2022.csv"); df22["Season"] = "22-23"
+    df23 = pd.read_csv("Data/PL2023.csv"); df23["Season"] = "23-24"
+    df24 = pd.read_csv("Data/PL2024.csv"); df24["Season"] = "24-25"
+    df25 = pd.read_csv("Data/PL2025.csv"); df25["Season"] = "25-26"
+
+    raw_all = pd.concat([df20, df21, df22, df23, df24, df25], ignore_index=True)
+    raw_all["Date"] = pd.to_datetime(raw_all["Date"], dayfirst=True, errors="coerce").dt.normalize()
+
+    df = version1_dataset(raw_all.copy())
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
+
+    if cutoff_date is None:
+        season_to_use = "25-26"
+        cutoff = df[df["Season"] == season_to_use]["Date"].max()
+    else:
+        cutoff = pd.to_datetime(cutoff_date).normalize()
+        season_ranges = df.groupby("Season")["Date"].agg(["min", "max"]).reset_index()
+        season_match = season_ranges[(season_ranges["min"] <= cutoff) & (cutoff <= season_ranges["max"])]
+
+        if len(season_match) == 0:
+            raise ValueError("cutoff_date does not fall inside any season date range in your data.")
+
+        season_to_use = season_match.iloc[0]["Season"]
+
+    season_df = df[df["Season"] == season_to_use].copy()
+    season_so_far = season_df[season_df["Date"] <= cutoff].copy()
+    season_so_far = season_so_far.sort_values(["Date", "Time"]).reset_index(drop=True)
+
+    if cutoff_date is None:
+        future = get_schedule(season_so_far).copy()
+        future["Season"] = season_to_use
+    else:
+        season_raw = raw_all[raw_all["Season"] == season_to_use].copy()
+        future = get_historic_schedule(season_raw, cutoff).copy()
+        future["Season"] = season_to_use
+
+    future["Date"] = pd.to_datetime(future["Date"], dayfirst=True, errors="coerce").dt.normalize()
+    future["Weekday"] = future["Date"].dt.day_name()
+
+    if "Time" in future.columns:
+        future["Time"] = pd.to_datetime(future["Time"], errors="coerce").dt.hour
+    else:
+        future["Time"] = np.nan
+
+    future = future.sort_values(["Date", "Time", "Team"]).reset_index(drop=True)
+
+    future["h_team"] = future.groupby(["Season", "Team"]).cumcount() + 1
+
+    hist_stats = season_so_far.copy()
+    hist_bet = df[df["Date"] <= cutoff].copy()
+    hist_bet = hist_bet.sort_values(["Date", "Time"]).reset_index(drop=True)
+
+    if len(hist_stats) <= 1:
+        league_avg_pxg = np.nan
+    else:
+        league_avg_pxg = hist_stats["PredictedXG"].iloc[:-1].mean()
+
+    weights = {"fouls": 1.0, "yellow": 3.0, "red": 6.0}
+
+    def last_w_mean(values, w, min_periods=None):
+        values = np.asarray(values, dtype=float)
+        values = values[~np.isnan(values)]
+        if min_periods is not None and len(values) < min_periods:
+            return np.nan
+        if len(values) < w:
+            return np.nan
+        return values[-w:].mean()
+
+    team_stats_cache = {t: g.sort_values(["Date", "Time"]) for t, g in hist_stats.groupby("Team")}
+    team_bet_cache = {t: g.sort_values(["Date", "Time"]) for t, g in hist_bet.groupby("Team")}
+    opp_bet_cache  = {o: g.sort_values(["Date", "Time"]) for o, g in hist_bet.groupby("Opponent")}
+
+    att_goals, att_shots, att_sot, att_corners = [], [], [], []
+    opp_def_goals, opp_def_shots, opp_def_sot, opp_def_corners = [], [], [], []
+    attack_strength, defence_strength = [], []
+    agg_for, opp_agg_for = [], []
+
+    for r in future.itertuples(index=False):
+        W_stats = expanding_window_len(int(r.h_team), stats_start, stats_max, stats_growth)
+        W_bet = expanding_window_len(int(r.h_team), bet_start, bet_max, bet_growth)
+
+        tg = team_stats_cache.get(r.Team)
+        og = team_stats_cache.get(r.Opponent)
+
+        tb = team_bet_cache.get(r.Team)
+        ob_def = opp_bet_cache.get(r.Opponent)
+
+        if tg is None or og is None or tb is None or ob_def is None:
+            att_goals.append(np.nan); att_shots.append(np.nan); att_sot.append(np.nan); att_corners.append(np.nan)
+            opp_def_goals.append(np.nan); opp_def_shots.append(np.nan); opp_def_sot.append(np.nan); opp_def_corners.append(np.nan)
+            attack_strength.append(np.nan); defence_strength.append(np.nan)
+            agg_for.append(np.nan); opp_agg_for.append(np.nan)
+            continue
+
+        att_goals.append(last_w_mean(tg["Team Goals"].to_numpy(), W_stats))
+        att_shots.append(last_w_mean(tg["Team Shots"].to_numpy(), W_stats))
+        att_sot.append(last_w_mean(tg["Team SOT"].to_numpy(), W_stats))
+        att_corners.append(last_w_mean(tg["Team Corners"].to_numpy(), W_stats))
+
+        opp_def_goals.append(last_w_mean(og["Opponent Goals"].to_numpy(), W_stats))
+        opp_def_shots.append(last_w_mean(og["Opponent Shots"].to_numpy(), W_stats))
+        opp_def_sot.append(last_w_mean(og["Opponent SOT"].to_numpy(), W_stats))
+        opp_def_corners.append(last_w_mean(og["Opponent Corners"].to_numpy(), W_stats))
+
+        team_pxg = last_w_mean(tb["PredictedXG"].to_numpy(), W_bet, min_periods=10)
+        opp_pxg_def = last_w_mean(ob_def["PredictedXG"].to_numpy(), W_bet, min_periods=10)
+
+        if np.isnan(league_avg_pxg) or league_avg_pxg == 0:
+            attack_strength.append(np.nan)
+            defence_strength.append(np.nan)
+        else:
+            attack_strength.append(team_pxg / league_avg_pxg)
+            defence_strength.append(opp_pxg_def / league_avg_pxg)
+
+        fouls = last_w_mean(tg["Team Fouls"].to_numpy(), W_stats)
+        yell = last_w_mean(tg["Team Yellow Cards"].to_numpy(), W_stats)
+        red = last_w_mean(tg["Team Red Cards"].to_numpy(), W_stats)
+        agg_for.append(weights["fouls"] * fouls + weights["yellow"] * yell + weights["red"] * red)
+
+        ofouls = last_w_mean(og["Team Fouls"].to_numpy(), W_stats)
+        oyell = last_w_mean(og["Team Yellow Cards"].to_numpy(), W_stats)
+        ored = last_w_mean(og["Team Red Cards"].to_numpy(), W_stats)
+        opp_agg_for.append(weights["fouls"] * ofouls + weights["yellow"] * oyell + weights["red"] * ored)
+
+    future["att_goals"] = att_goals
+    future["att_shots"] = att_shots
+    future["att_sot"] = att_sot
+    future["att_corners"] = att_corners
+
+    future["opp_def_goals_conceded"] = opp_def_goals
+    future["opp_def_shots_conceded"] = opp_def_shots
+    future["opp_def_sot_conceded"] = opp_def_sot
+    future["opp_def_corners_conceded"] = opp_def_corners
+
+    future["attack_strength"] = attack_strength
+    future["defence_strength"] = defence_strength
+
+    future["agg_for"] = agg_for
+    future["opp_agg_for"] = opp_agg_for
+
+    future = enriching_features(future)
+
+    future["location_code"] = future["Location"].astype("category").cat.codes
+    future["opp_code"] = future["Opponent"].astype("category").cat.codes
+    future["team_code"] = future["Team"].astype("category").cat.codes
+    future["season_code"] = future["Season"].astype("category").cat.codes
+    future["weekday_code"] = future["Weekday"].astype("category").cat.codes
+
+    future = future.dropna().reset_index(drop=True)
+    return future
+
+
+def get_current_table():
+    df25 = pd.read_csv('Data/PL2025.csv')
+    df25['Season'] = '25-26'
+    data_all = version1_dataset(df25)
+
+    data_all["Pts"] = np.select(
+    [
+        data_all["Team Goals"] > data_all["Opponent Goals"],
+        data_all["Team Goals"] == data_all["Opponent Goals"]
+    ], [3, 1],default=0)
+
+    table = (
+        data_all.groupby("Team")
+        .agg(
+            GF=("Team Goals", "sum"),
+            GA=("Opponent Goals", "sum"), 
+            Pts=("Pts", "sum")))
+
+    table["GD"] = table["GF"] - table["GA"]
+
+    table = table.sort_values(["Pts", "GD", "GF"],ascending=False)
+
+    return table[['GF', 'GA', 'GD', 'Pts']]
+
+def future_xg_model():
+    predictors = ['Time', 'att_goals', 'att_shots', 'att_sot', 'att_corners', 
+              'opp_def_goals_conceded', 'opp_def_shots_conceded', 
+              'opp_def_sot_conceded', 'opp_def_corners_conceded', 
+              'attack_strength', 'defence_strength', 
+              'agg_for', 'opp_agg_for', 
+              'TeamPromoted', 'TeamInEurope', 
+              'OppPromoted', 'OppInEurope', 
+              'location_code', 'opp_code', 
+              'team_code', 'season_code', 
+              'weekday_code']
+
+    data_current = prepare_data(6, 14)
+    train = data_current
+
+    test = prepare_data_future(stats_start=6, stats_max=6, stats_growth=0.1,
+        bet_start=14, bet_max=16, bet_growth=0.04,).copy()
+
+    xgb = XGBRegressor(
+        n_estimators=800,
+        learning_rate=0.03,
+        max_depth=4,
+        subsample=0.7,
+        random_state=1
+    )
+
+    xgb.fit(train[predictors], train["PredictedXG"])
+    preds = xgb.predict(test[predictors])
+
+    prediction_df = test.copy()[['Season', 'Date', 'Team', 'Opponent', 'Location']]
+    prediction_df['Predictions'] = preds
+
+    return prediction_df
+
+
+def get_full_fixtures(future):
+    future_home = future[future["Location"] == "Home"].copy()
+    future_away = future[future["Location"] == "Away"].copy()
+
+    fixtures = future_home.merge(
+        future_away,
+        left_on=["Season", "Date", "Team", "Opponent"],
+        right_on=["Season", "Date", "Opponent", "Team"],
+        suffixes=("_home", "_away")
+    )
+
+    fixtures["HomeTeam"] = fixtures["Team_home"]
+    fixtures["AwayTeam"] = fixtures["Opponent_home"]
+    fixtures["lambda_home"] = fixtures["Predictions_home"]
+    fixtures["lambda_away"] = fixtures["Predictions_away"]
+
+    fixtures = fixtures[["Season", "Date", "HomeTeam", "AwayTeam", "lambda_home", "lambda_away"]]
+    return fixtures
+
+
+def simulate_one_season(fixtures):
+    table = get_current_table()
+
+    for r in fixtures.itertuples(index=False):
+        home = r.HomeTeam
+        away = r.AwayTeam
+
+        gh = np.random.poisson(r.lambda_home)
+        ga = np.random.poisson(r.lambda_away)
+
+        table.loc[home, "GF"] += gh
+        table.loc[home, "GA"] += ga
+        table.loc[away, "GF"] += ga
+        table.loc[away, "GA"] += gh
+
+        table.loc[home, "GD"] = table.loc[home, "GF"] - table.loc[home, "GA"]
+        table.loc[away, "GD"] = table.loc[away, "GF"] - table.loc[away, "GA"]
+
+        if gh > ga:
+            table.loc[home, "Pts"] += 3
+        elif gh < ga:
+            table.loc[away, "Pts"] += 3
+        else:
+            table.loc[home, "Pts"] += 1
+            table.loc[away, "Pts"] += 1
+
+    final = table.sort_values(["Pts", "GD", "GF"], ascending=False).copy()
+    final["Position"] = np.arange(1, len(final) + 1)
+    return final
+
+
+def simulate_seasons(num_simulations):
+    table_start = get_current_table()
+    future = future_xg_model()
+    fixtures = get_full_fixtures(future)
+
+    teams = table_start.index.tolist()
+    pos_counts = pd.DataFrame(0, index=teams, columns=np.arange(1, len(teams) + 1))
+
+    for _ in range(num_simulations):
+        final = simulate_one_season(fixtures)
+        for team, pos in final["Position"].items():
+            pos_counts.loc[team, pos] += 1
+        
+    pos_probs = np.round((pos_counts / num_simulations) * 100, 2)
+
+    return pos_probs
+
+
+def plot_final_matrix(gtable):
+    plt.figure(figsize=(16, 10))
+
+    ax = sns.heatmap(
+        gtable,
+        cmap="Reds",
+        annot=True,
+        fmt=".2f",
+        linewidths=0.5,
+        cbar=False
+    )
+
+    ax.xaxis.tick_top()
+    ax.xaxis.set_label_position('top')
+
+    plt.title("Premier League Finish Probabilities (%)", pad=40)
+    plt.xlabel("Position")
+    plt.ylabel("Team")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def _collapse_zero_teams(series, label="Any other team"):
+    s = series.copy()
+    zeros = s[s == 0]
+    nonzeros = s[s != 0]
+
+    if len(zeros) > 0:
+        nonzeros.loc[label] = 0.0
+
+    return nonzeros.sort_values(ascending=False)
+
+
+def _plot_one_col_heatmap(series, title):
+    out = series.to_frame(title)
+
+    plt.figure(figsize=(6, 10))
+    ax = sns.heatmap(out, cmap="Reds", annot=True, fmt=".2f", cbar=False, linewidths=0.5)
+
+    ax.xaxis.tick_top()
+    ax.xaxis.set_label_position("top")
+
+    plt.title(title, pad=30)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_finish_1st(gtable):
+    probs = _collapse_zero_teams(gtable[1])
+    _plot_one_col_heatmap(probs, "Winning The League (%)")
+
+
+def plot_finish_top4(gtable):
+    probs = _collapse_zero_teams(gtable.loc[:, 1:4].sum(axis=1))
+    _plot_one_col_heatmap(probs, "Finish Top 4 (%)")
+
+
+def plot_finish_top5(gtable):
+    probs = _collapse_zero_teams(gtable.loc[:, 1:5].sum(axis=1))
+    _plot_one_col_heatmap(probs, "Finish Top 5 (%)")
+
+
+def plot_finish_top10(gtable):
+    probs = _collapse_zero_teams(gtable.loc[:, 1:10].sum(axis=1))
+    _plot_one_col_heatmap(probs, "Finish Top 10 (%)")
+
+
+def plot_finish_bottom10(gtable):
+    probs = _collapse_zero_teams(gtable.loc[:, 11:20].sum(axis=1))
+    _plot_one_col_heatmap(probs, "Finish Bottom 10 (%)")
+
+
+def plot_finish_bottom3(gtable):
+    probs = _collapse_zero_teams(gtable.loc[:, 18:20].sum(axis=1))
+    _plot_one_col_heatmap(probs, "Relegation (%)")
