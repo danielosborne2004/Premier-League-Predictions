@@ -478,9 +478,6 @@ def get_historic_schedule(season_raw_df, cutoff_date):
     return schedule
 
 
-import numpy as np
-import pandas as pd
-
 def prepare_data_future(stats_start, stats_max, stats_growth, bet_start, bet_max, bet_growth, cutoff_date=None):
     """
     Build the modelling dataframe for future fixtures by dynamically populating rolling features
@@ -662,6 +659,22 @@ def prepare_data_future(stats_start, stats_max, stats_growth, bet_start, bet_max
 
 
 def get_current_table():
+    """
+    Construct the current Premier League table from the 2025–26 results dataset.
+
+    The function loads match results, computes points from match outcomes,
+    aggregates goals for/against and points by team, and returns the league
+    table sorted by standard ranking rules (Points, Goal Difference, Goals For).
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame indexed by Team containing:
+        - GF : Goals For
+        - GA : Goals Against
+        - GD : Goal Difference
+        - Pts : Total Points
+    """
     df25 = pd.read_csv('Data/PL2025.csv')
     df25['Season'] = '25-26'
     data_all = version1_dataset(df25)
@@ -686,6 +699,24 @@ def get_current_table():
     return table[['GF', 'GA', 'GD', 'Pts']]
 
 def future_xg_model():
+    """
+    Train the expected goals (xG) model and generate predictions for future fixtures.
+
+    The function trains an XGBoost regression model on historical match data to
+    predict expected goals, then applies the trained model to future fixtures
+    using expanding-window features.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame containing predicted expected goals for future matches with:
+        - Season
+        - Date
+        - Team
+        - Opponent
+        - Location
+        - Predictions (predicted xG)
+    """
     predictors = ['Time', 'att_goals', 'att_shots', 'att_sot', 'att_corners', 
               'opp_def_goals_conceded', 'opp_def_shots_conceded', 
               'opp_def_sot_conceded', 'opp_def_corners_conceded', 
@@ -721,6 +752,30 @@ def future_xg_model():
 
 
 def get_full_fixtures(future):
+    """
+    Combine home and away xG predictions into a single fixtures dataset.
+
+    The function merges the future home and away predictions so each row
+    represents a complete fixture with both teams’ expected goals (lambdas)
+    for simulation.
+
+    Parameters
+    ----------
+    future : pandas.DataFrame
+        Output from future_xg_model() containing predicted xG for each team
+        and match location.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Fixture-level dataset containing:
+        - Season
+        - Date
+        - HomeTeam
+        - AwayTeam
+        - lambda_home : expected goals for the home team
+        - lambda_away : expected goals for the away team
+    """
     future_home = future[future["Location"] == "Home"].copy()
     future_away = future[future["Location"] == "Away"].copy()
 
@@ -741,6 +796,34 @@ def get_full_fixtures(future):
 
 
 def simulate_one_season(fixtures):
+    """
+    Simulate the remainder of a Premier League season using Poisson goal sampling.
+
+    Starting from the current league table, the function simulates each remaining
+    fixture by sampling home and away goals from Poisson distributions using the
+    predicted expected goals (lambdas). The league table is updated after every
+    simulated match and then sorted to produce the final standings.
+
+    Parameters
+    ----------
+    fixtures : pandas.DataFrame
+        Fixture-level dataset containing predicted goal rates from
+        get_full_fixtures(), including:
+        - HomeTeam
+        - AwayTeam
+        - lambda_home
+        - lambda_away
+
+    Returns
+    -------
+    pandas.DataFrame
+        Final simulated league table including:
+        - GF : Goals For
+        - GA : Goals Against
+        - GD : Goal Difference
+        - Pts : Points
+        - Position : Final league position
+    """
     table = get_current_table()
 
     for r in fixtures.itertuples(index=False):
@@ -772,6 +855,25 @@ def simulate_one_season(fixtures):
 
 
 def simulate_seasons(num_simulations):
+    """
+    Run multiple season simulations to estimate finishing position probabilities.
+
+    The function repeatedly simulates the remainder of the season using the
+    Poisson-based match simulator and tracks how often each team finishes in
+    each league position. The counts are converted into percentage probabilities.
+
+    Parameters
+    ----------
+    num_simulations : int
+        Number of season simulations to run.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame indexed by Team with columns representing league positions
+        (1-20). Each cell contains the probability (%) of finishing in that
+        position.
+    """
     table_start = get_current_table()
     future = future_xg_model()
     fixtures = get_full_fixtures(future)
@@ -790,6 +892,9 @@ def simulate_seasons(num_simulations):
 
 
 def plot_final_matrix(gtable):
+    """
+    Clean plotting for the final matrix.
+    """
     plt.figure(figsize=(16, 10))
 
     ax = sns.heatmap(
@@ -812,56 +917,61 @@ def plot_final_matrix(gtable):
     plt.show()
 
 
-def _collapse_zero_teams(series, label="Any other team"):
+def _market_df_from_series(series, title, collapse_zeros=True, zero_label="Any other team"):
+    """
+    Takes a Series indexed by Team with values as probabilities (%),
+    returns a tidy DataFrame for presentation/export.
+
+    Output columns: Team, <title>
+    """
     s = series.copy()
-    zeros = s[s == 0]
-    nonzeros = s[s != 0]
 
-    if len(zeros) > 0:
-        nonzeros.loc[label] = 0.0
+    if collapse_zeros:
+        zeros = s[s == 0]
+        nonzeros = s[s != 0].copy()
+        if len(zeros) > 0:
+            nonzeros.loc[zero_label] = 0.0
+        s = nonzeros
 
-    return nonzeros.sort_values(ascending=False)
-
-
-def _plot_one_col_heatmap(series, title):
-    out = series.to_frame(title)
-
-    plt.figure(figsize=(6, 10))
-    ax = sns.heatmap(out, cmap="Reds", annot=True, fmt=".2f", cbar=False, linewidths=0.5)
-
-    ax.xaxis.tick_top()
-    ax.xaxis.set_label_position("top")
-
-    plt.title(title, pad=30)
-    plt.tight_layout()
-    plt.show()
+    out = (
+        s.sort_values(ascending=False)
+         .reset_index()
+         .rename(columns={"index": "Team"})
+    )
+    out.columns = ["Team", title]
+    return out
 
 
-def plot_finish_1st(gtable):
-    probs = _collapse_zero_teams(gtable[1])
-    _plot_one_col_heatmap(probs, "Winning The League (%)")
+def df_finish_1st(gtable):
+    # Position 1
+    return _market_df_from_series(gtable[1], "Winning The League (%)")
 
 
-def plot_finish_top4(gtable):
-    probs = _collapse_zero_teams(gtable.loc[:, 1:4].sum(axis=1))
-    _plot_one_col_heatmap(probs, "Finish Top 4 (%)")
+def df_finish_top4(gtable):
+    # Positions 1-4
+    series = gtable.loc[:, 1:4].sum(axis=1)
+    return _market_df_from_series(series, "Finish Top 4 (%)")
 
 
-def plot_finish_top5(gtable):
-    probs = _collapse_zero_teams(gtable.loc[:, 1:5].sum(axis=1))
-    _plot_one_col_heatmap(probs, "Finish Top 5 (%)")
+def df_finish_top5(gtable):
+    # Positions 1-5
+    series = gtable.loc[:, 1:5].sum(axis=1)
+    return _market_df_from_series(series, "Finish Top 5 (%)")
 
 
-def plot_finish_top10(gtable):
-    probs = _collapse_zero_teams(gtable.loc[:, 1:10].sum(axis=1))
-    _plot_one_col_heatmap(probs, "Finish Top 10 (%)")
+def df_finish_top10(gtable):
+    # Positions 1-10
+    series = gtable.loc[:, 1:10].sum(axis=1)
+    return _market_df_from_series(series, "Finish Top 10 (%)")
 
 
-def plot_finish_bottom10(gtable):
-    probs = _collapse_zero_teams(gtable.loc[:, 11:20].sum(axis=1))
-    _plot_one_col_heatmap(probs, "Finish Bottom 10 (%)")
+def df_finish_bottom10(gtable):
+    # Positions 11-20
+    series = gtable.loc[:, 11:20].sum(axis=1)
+    return _market_df_from_series(series, "Finish Bottom 10 (%)")
 
 
-def plot_finish_bottom3(gtable):
-    probs = _collapse_zero_teams(gtable.loc[:, 18:20].sum(axis=1))
-    _plot_one_col_heatmap(probs, "Relegation (%)")
+def df_finish_bottom3(gtable):
+    # Positions 18-20
+    series = gtable.loc[:, 18:20].sum(axis=1)
+    return _market_df_from_series(series, "Relegation (%)")
