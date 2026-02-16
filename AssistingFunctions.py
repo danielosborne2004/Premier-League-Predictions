@@ -909,7 +909,7 @@ def plot_final_matrix(gtable):
     ax.xaxis.tick_top()
     ax.xaxis.set_label_position('top')
 
-    plt.title("Premier League Finish Probabilities (%)", pad=40)
+    plt.title("Premier League Final Position Probabilities (%)", pad=40)
     plt.xlabel("Position")
     plt.ylabel("Team")
 
