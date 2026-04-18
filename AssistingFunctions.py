@@ -891,6 +891,184 @@ def simulate_seasons(num_simulations):
     return pos_probs
 
 
+def _simulate_one_season_tracked(fixtures, track_iloc):
+    """
+    Like simulate_one_season but also records the result of a specific fixture.
+
+    Parameters
+    ----------
+    fixtures : pd.DataFrame
+        Fixture-level dataset with lambda_home / lambda_away columns.
+    track_iloc : int
+        Integer position (iloc) of the fixture whose result should be recorded.
+
+    Returns
+    -------
+    final : pd.DataFrame
+        Final simulated league table with Position column.
+    result : str
+        'home_win', 'draw', or 'away_win' for the tracked fixture.
+    """
+    table = get_current_table()
+    tracked_result = None
+
+    for i, r in enumerate(fixtures.itertuples(index=False)):
+        gh = np.random.poisson(r.lambda_home)
+        ga = np.random.poisson(r.lambda_away)
+
+        if i == track_iloc:
+            if gh > ga:
+                tracked_result = "home_win"
+            elif gh == ga:
+                tracked_result = "draw"
+            else:
+                tracked_result = "away_win"
+
+        table.loc[r.HomeTeam, "GF"] += gh
+        table.loc[r.HomeTeam, "GA"] += ga
+        table.loc[r.AwayTeam, "GF"] += ga
+        table.loc[r.AwayTeam, "GA"] += gh
+
+        table.loc[r.HomeTeam, "GD"] = table.loc[r.HomeTeam, "GF"] - table.loc[r.HomeTeam, "GA"]
+        table.loc[r.AwayTeam, "GD"] = table.loc[r.AwayTeam, "GF"] - table.loc[r.AwayTeam, "GA"]
+
+        if gh > ga:
+            table.loc[r.HomeTeam, "Pts"] += 3
+        elif gh < ga:
+            table.loc[r.AwayTeam, "Pts"] += 3
+        else:
+            table.loc[r.HomeTeam, "Pts"] += 1
+            table.loc[r.AwayTeam, "Pts"] += 1
+
+    final = table.sort_values(["Pts", "GD", "GF"], ascending=False).copy()
+    final["Position"] = np.arange(1, len(final) + 1)
+    return final, tracked_result
+
+
+def simulate_seasons_conditional(num_simulations, home_team="Man City", away_team="Arsenal",
+                                  home_display=None, away_display=None):
+    """
+    Run num_simulations and return three position probability matrices conditioned
+    on the result of a specific fixture (home_team vs away_team).
+
+    The 10,000 simulations are split naturally across the three outcome buckets
+    (home win / draw / away win) in proportion to how often each outcome occurs.
+    Each matrix is then normalised within its own bucket.
+
+    Parameters
+    ----------
+    num_simulations : int
+        Total simulations to run, divided across all three outcome buckets.
+    home_team : str
+        Home team name as it appears in the fixtures data (default 'Man City').
+    away_team : str
+        Away team name as it appears in the fixtures data (default 'Arsenal').
+    home_display : str, optional
+        Full display name for the home team used in plot titles.
+        Defaults to home_team if not provided.
+    away_display : str, optional
+        Full display name for the away team used in plot titles.
+        Defaults to away_team if not provided.
+
+    Returns
+    -------
+    dict with keys:
+        'home_win' : DataFrame — position probabilities (%) if home_team wins.
+        'draw'     : DataFrame — position probabilities (%) if the match draws.
+        'away_win' : DataFrame — position probabilities (%) if away_team wins.
+        'titles'   : dict mapping each key to its display title string.
+        'n_sims'   : dict mapping each key to the simulation count in that bucket.
+    """
+    home_label = home_display or home_team
+    away_label = away_display or away_team
+
+    table_start = get_current_table()
+    future = future_xg_model()
+    fixtures = get_full_fixtures(future)
+
+    teams = table_start.index.tolist()
+    n_pos = len(teams)
+
+    mask = (fixtures["HomeTeam"] == home_team) & (fixtures["AwayTeam"] == away_team)
+    if not mask.any():
+        raise ValueError(f"Fixture '{home_team}' vs '{away_team}' not found in remaining fixtures.")
+
+    track_iloc = int(np.where(mask.values)[0][0])
+
+    home_win_counts = pd.DataFrame(0, index=teams, columns=np.arange(1, n_pos + 1))
+    draw_counts     = pd.DataFrame(0, index=teams, columns=np.arange(1, n_pos + 1))
+    away_win_counts = pd.DataFrame(0, index=teams, columns=np.arange(1, n_pos + 1))
+
+    count_map = {
+        "home_win": home_win_counts,
+        "draw":     draw_counts,
+        "away_win": away_win_counts,
+    }
+
+    for _ in range(num_simulations):
+        final, result = _simulate_one_season_tracked(fixtures, track_iloc)
+        for team, pos in final["Position"].items():
+            count_map[result].loc[team, pos] += 1
+
+    def to_probs(df):
+        n = df.sum(axis=1).iloc[0]
+        if n == 0:
+            return df.astype(float)
+        return np.round((df / n) * 100, 2)
+
+    titles = {
+        "away_win": f"League Predictions if {away_label} Beat {home_label} This Weekend",
+        "draw":     f"League Predictions if {away_label} Draw With {home_label} This Weekend",
+        "home_win": f"League Predictions if {home_label} Beat {away_label} This Weekend",
+    }
+
+    n_sims = {k: int(count_map[k].sum(axis=1).iloc[0]) for k in count_map}
+
+    return {
+        "home_win": to_probs(home_win_counts),
+        "draw":     to_probs(draw_counts),
+        "away_win": to_probs(away_win_counts),
+        "titles":   titles,
+        "n_sims":   n_sims,
+    }
+
+
+def plot_conditional_matrices(results):
+    """
+    Plot the three conditional position probability matrices returned by
+    simulate_seasons_conditional().
+
+    Parameters
+    ----------
+    results : dict
+        Return value of simulate_seasons_conditional().
+    """
+    titles = results["titles"]
+    n_sims = results["n_sims"]
+
+    for key in ["away_win", "draw", "home_win"]:
+        gtable = results[key]
+        n = n_sims[key]
+        title = f"{titles[key]}\n({n:,} simulations)"
+
+        plt.figure(figsize=(16, 10))
+        ax = sns.heatmap(
+            gtable,
+            cmap="Reds",
+            annot=True,
+            fmt=".2f",
+            linewidths=0.5,
+            cbar=False
+        )
+        ax.xaxis.tick_top()
+        ax.xaxis.set_label_position("top")
+        plt.title(title, pad=40)
+        plt.xlabel("Position")
+        plt.ylabel("Team")
+        plt.tight_layout()
+        plt.show()
+
+
 def plot_final_matrix(gtable):
     """
     Clean plotting for the final matrix.
