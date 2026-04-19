@@ -6,7 +6,7 @@ This project estimates the probability of each Premier League team finishing in 
 
 ## Methodology
 
-The full methodology is documented in **`PremierLeague_Model.html`** — open this file in any browser for a complete walkthrough covering:
+The full methodology is documented in **`PremierLeague_Model.ipynb`** — open this file on github for a complete walkthrough covering:
 
 - Target vector construction (deriving expected goals from betting market odds)
 - Feature engineering (rolling match stats, attack/defence strength, enrichment flags)
